@@ -1,0 +1,203 @@
+```{r, include = FALSE}
+rm(list=ls())
+library('RODBC')
+library('readr')
+library('mailR')
+library('dplyr')
+library('lubridate')   
+library('scales')
+library('xlsx')
+library('tidyr')
+library('readtext')
+#library('knitr')
+#library('ggplot2')
+
+#connection
+r <-odbcConnect("Trad_working")
+#r2 <- odbcConnect(dsn = "Trad_working", uid = "marina.lalak", pwd  = "t4pcma8zZkMo")
+
+#queries
+source('load_queries.R')
+
+#funnel
+source('pre_funnel.R')
+source('funnels.R')
+source('postFunnel.R')
+
+#grid
+source('segmentations.R')
+source('grid.R')
+source('dictionaries.R')
+source('writers.R')
+
+```
+
+
+```{r names and keys, include = FALSE}
+#PICK
+sites <- c("www.cupid.com", "www.girlsdateforfree.com", "www.loveagain.com", "www.maturedating.com", "www.uniformdating.com")
+platforms <-  c('app android', 'app iphone', 'mob', 'normal')
+countries <- c('US', 'GB', 'CA', 'AU', 'DK')
+traffic <- c('social PPC', 'direct')
+
+#Grid ready
+SNmi <- SN %>% picker(sites) %>% bf() %>% slice(1:5) %>% as.data.frame()
+RPmi <- RP %>% picker(platforms) %>% bf() 
+CGmi <- CG %>% picker(countries) %>% bf() 
+TSmi <- TS %>% picker(traffic) %>% bf() 
+rm(SN, CG, RP, TS)
+rm(sites, platforms, countries, traffic)
+
+#----- GRIDs --------------------------------------------------------------------------------------------------------
+marina_list <- list(SNmi, RPmi, CGmi) #define segment (SEGM)
+deeper_list <- list(LT, TSmi, GN, AG) #define deeper segmentation (DEEPs)
+
+full_grid <- grider(marina_list)
+
+#BASIC
+marina_grid_all  <- left_join(x = input_segments_all, y = full_grid, by = c("CG" = "country_iso2_source_key", "RP" = "PLATFORM_NAME", "SN" = "SITE_NAME"))
+
+#DEEP
+nice_grid <- nicer(marina_grid_all)
+marina_deep_grid <- deeper(nice_grid, deeper_list)
+
+rm(TSmi, LT, GN, AG)
+rm(SNmi, CGmi, RPmi)
+rm(input_segments, input_segments_all)
+```
+
+```{r}
+#Range dates
+rdate0  <- as.Date('2017-9-11')
+rdate1  <- as.Date('2017-9-24')
+
+#DATA   |   MDK ios USA
+via_data  <- sqlQuery(r, paste(c(sprintf(range_dates, rdate0-2, rdate1+2, marina_grid_all[25, ncol(marina_grid_all)])), sep = " ", collapse = " "), stringsAsFactors = FALSE)
+via_impacts <- funnel_via(pre_via(via_data))
+
+#PRODUCT
+product_data  <- sqlQuery(r, paste(c(sprintf(prange_dates, rdate0-2, rdate1+2, marina_grid_all[25, ncol(marina_grid_all)])), sep = " ", collapse = " "), stringsAsFactors = FALSE)
+product_data <- pre_via(product_data)
+
+
+pdt <- product_data %>% 
+  group_by(product) %>%
+  summarize(rev = sum(AMOUNT_USD), charged_u = sum(charged_u), attempts_u = sum(attempts_u)) %>%
+  as.data.frame() %>%
+  arrange(desc(charged_u))
+
+
+# fuck <- pdt %>% mutate(
+#          package = case_when(product %like% "%3 Days%" ~ "3d_trial", 
+#                   (product %like% "%1 Week%" | product %like% "%day.7%") ~ then "1_week", 
+#                   (product %like% "%1 Month%" | product %like% "%day.30%" | product %like% "%month.1%" | product %like% "%day.31%") ~ then "1_month",
+#                   (product %like% "%3 Months%" | product %like% "%day.90%" | product %like% "%month.3%") ~ "3_month", 
+#                   (product %like% "%6 Month%" | product %like% "%day.180%" | product %like% "%month.6%") ~ "6_ month",
+#                   TRUE ~ "other" )
+#                   )
+
+#VIA NAME
+funnel_prod <- function(x) {
+  temp_tt <- x %>%
+    group_by(teh_period) %>%
+    summarize(logins = sum(logins),
+                redirects_u = sum(redirects_u),
+                attempts_u = sum(attempts_u),
+                charged_u = sum(charged_u),
+                rev = sum(AMOUNT_USD)) %>%
+    as.data.frame()
+  
+  #BY PROD
+  temp_prod <- x %>%
+      group_by(teh_period, product) %>%
+      summarize(logins = sum(logins),
+                redirects_u = sum(redirects_u),
+                attempts_u = sum(attempts_u),
+                charged_u = sum(charged_u),
+                rev = sum(AMOUNT_USD)) %>%
+      as.data.frame()
+  
+  #top N
+  tp <- temp_prod %>% 
+    filter(teh_period == "m_week_1") %>%
+    top_n(10, redirects_u) %>%
+    select(product)
+  
+  temp_prod_10 <- filter(temp_prod, product %in% tp[[1]])
+  temp_prod_other <- temp_via %>%
+    filter(! product %in% tp[[1]]) %>%
+    group_by(teh_period) %>%
+    summarize(redirects_u = sum(redirects_u), attempts_u = sum(attempts_u), charged_u = sum(charged_u), rev = sum(rev), logins = sum(logins)) %>%
+    mutate(product = "other") %>%
+    as.data.frame
+  
+  temp_top  <- rbind(temp_prod_10, temp_prod_other)
+  
+  #with totals
+  temp_top1 <- left_join(x = temp_top, y = temp_tt, by = c("teh_period" = "teh_period"))
+  temp_top1 <- temp_top1 %>%
+    select(teh_period, product,  redirects_t = redirects_u.y, rev = rev.x, rev_t = rev.y, logins_t = logins.y) %>%
+    arrange(product)
+  
+  #KPIs # # # # #  # AZAZA TUT NIHUIA NE SDELAL
+  temp_top2 <- temp_top1 %>%
+    mutate(rev2log = rev/logins_t, revSh = rev/rev_t) %>%
+    mutate(redShChange = (redSh - lag(redSh, n = 1L, order_by = via_name)), revShChange = (revSh - lag(revSh, n = 1L, order_by = via_name)),
+      rev2logCh = (rev2log / lag(rev2log, n = 1L, order_by = via_name) - 1),
+      POIrev2log = ((rev2log-lag(rev2log, n = 1L, order_by = via_name))/(lag(rev_t, n = 1L, order_by = via_name)/lag(redirects_t, n = 1L, order_by = via_name)))) %>%
+    
+    filter(teh_period == "m_week_1") %>%
+    select(via_name, redirects_u, rev, rev2log, redSh, redShChange, revSh, revShChange, rev2logCh, POIrev2log)
+  return(temp_top2)
+  }
+```
+
+
+### report
+```{r}
+#BARBARIAN (KPIs on SEGM only)
+td <- looper_lazy(marina_grid_all, td_mat) 
+td_lt <- looper_lazy(marina_grid_lt, td_mat)
+#td_precise <- looper_heavy(marina_grid_all, td_mat_old)
+
+#create grid with DEEPs
+td_deep <- deep_loop(marina_deep_grid, td_mat, looper_lazy) #heavy motherfucker
+td_long <- dumb_writer(td_deep)
+```
+
+### Write excel
+```{r , echo = FALSE}
+### MARINA
+teh_name  <- paste("top_kpi_weekly_TD_", as.character(Sys.Date()), ".xlsx", sep = "")
+
+template <- loadWorkbook("weekly_template.xlsx")
+removeSheet(template, sheetName="data")
+removeSheet(template, sheetName="data_full")
+saveWorkbook(template, file = teh_name)
+
+write.xlsx(x = td, file = teh_name, sheetName="data", col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+write.xlsx(x = td_long, file = teh_name, sheetName="data_full", col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+
+```
+
+# Send mail
+```{r, echo = FALSE}
+#Send
+sender <- "igor.kraynikov@together.com"  
+recipients <- c("igor.kraynikov@together.com", "marina.lalak@together.com")  
+
+send.mail(from = sender,
+                   to = recipients,
+                   subject= "Top Metrics weekly TD",
+                   body = "plese see attached",
+                   attach.files = c(teh_name),#, deep_name),
+                   smtp = list(host.name = "mail.together.com", port = 143, user.name = "igor.kraynikov", passwd = "Huiigovno12345!@#$%^", ssl = TRUE, tls=TRUE),
+                   authenticate = TRUE,
+                   send = TRUE)
+
+#Delete
+if (file.exists(teh_name)) file.remove(teh_name)
+```
+
+
+
